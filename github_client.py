@@ -1,24 +1,19 @@
 """
-GitHub API client for fetching PR data from PostHog/posthog.
+GitHub GraphQL client for fetching PR data from PostHog/posthog.
 
-Simplified version: fetches merged PRs and PR details only.
-Reviews are not fetched to reduce API calls and avoid rate limits.
-The analysis module uses a fallback collaboration model based on comment counts.
+JSON-first design: saves PR data to a local JSON file (data/merged_prs_posthog_90d.json).
+Uses the JSON file by default, only fetches from GitHub API when file is missing or --refresh.
 """
 
-import os
+import argparse
 import json
-import hashlib
+import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock
 
 import pandas as pd
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -26,375 +21,420 @@ load_dotenv()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO_OWNER = "PostHog"
 REPO_NAME = "posthog"
-BASE_URL = "https://api.github.com"
-CACHE_DIR = Path(".cache")
-MAX_WORKERS = 1
-REQUEST_DELAY = 0.2
+GRAPHQL_URL = "https://api.github.com/graphql"
+DATA_DIR = Path("data")
+PAGE_SIZE = 100
+MAX_PAGES = 100
+MAX_PRS_WARNING = 500
 MAX_RETRIES = 5
-BACKOFF_FACTOR = 1.0
-MAX_PAGES = 10  # Hard cap on pages scanned to avoid runaway fetching
-MAX_PRS_WARNING = 500  # Warn and stop if more PRs than this
-
-# Thread-safe progress counter and rate limit state
-_progress_lock = Lock()
-_progress_count = 0
-_rate_limit_lock = Lock()
-_rate_limit_reset_time = 0
-
-# Global session for connection reuse
-_session: requests.Session | None = None
-_session_lock = Lock()
+BACKOFF_FACTOR = 2.0
+REQUEST_TIMEOUT = 30
+CHECKPOINT_INTERVAL = 5
+EARLY_STOP_THRESHOLD = 2
 
 
-def _get_session() -> requests.Session:
-    """Get or create a thread-safe requests session with connection pooling."""
-    global _session
-    with _session_lock:
-        if _session is None:
-            _session = requests.Session()
-            retry_strategy = Retry(
-                total=3,
-                backoff_factor=0.5,
-                status_forcelist=[500, 502, 503, 504],
-            )
-            adapter = HTTPAdapter(max_retries=retry_strategy, pool_maxsize=MAX_WORKERS + 2)
-            _session.mount("https://", adapter)
-            _session.mount("http://", adapter)
-        return _session
+# =============================================================================
+# JSON Dataset Storage
+# =============================================================================
+
+def _get_data_file_path(days: int) -> Path:
+    """Get the JSON file path for PR data."""
+    return DATA_DIR / f"merged_prs_posthog_{days}d.json"
 
 
-def _get_headers() -> dict:
-    headers = {"Accept": "application/vnd.github+json"}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-    return headers
-
-
-def _check_rate_limit(response: requests.Response) -> None:
-    """Check rate limit headers and sleep if we're close to the limit."""
-    global _rate_limit_reset_time
-    
-    remaining = response.headers.get("X-RateLimit-Remaining")
-    reset_time = response.headers.get("X-RateLimit-Reset")
-    
-    if remaining is not None and reset_time is not None:
-        remaining = int(remaining)
-        reset_timestamp = int(reset_time)
-        
-        if remaining < 10:
-            with _rate_limit_lock:
-                _rate_limit_reset_time = reset_timestamp
-            wait_time = max(0, reset_timestamp - time.time()) + 1
-            print(f"\n  [Rate Limit] Only {remaining} requests remaining. Waiting {wait_time:.0f}s until reset...")
-            time.sleep(wait_time)
-
-
-def _handle_rate_limit_error(response: requests.Response) -> float:
-    """Handle 403/429 rate limit errors. Returns seconds to wait."""
-    reset_time = response.headers.get("X-RateLimit-Reset")
-    retry_after = response.headers.get("Retry-After")
-    
-    if retry_after:
-        return float(retry_after)
-    elif reset_time:
-        wait_time = max(0, int(reset_time) - time.time()) + 1
-        return wait_time
-    else:
-        return 60
-
-
-def _request_with_retry(method: str, url: str, params: dict = None) -> requests.Response:
-    """Make a request with exponential backoff retry for rate limits."""
-    session = _get_session()
-    headers = _get_headers()
-    
-    for attempt in range(MAX_RETRIES):
-        time.sleep(REQUEST_DELAY)
-        
-        response = session.request(method, url, headers=headers, params=params)
-        
-        if response.status_code == 200:
-            _check_rate_limit(response)
-            return response
-        
-        if response.status_code in (403, 429):
-            if attempt < MAX_RETRIES - 1:
-                wait_time = _handle_rate_limit_error(response)
-                wait_time = min(wait_time, 300)
-                backoff = BACKOFF_FACTOR * (2 ** attempt)
-                total_wait = max(wait_time, backoff)
-                
-                print(f"\n  [Rate Limited] HTTP {response.status_code} on {url}")
-                print(f"  [Rate Limited] Retry {attempt + 1}/{MAX_RETRIES} in {total_wait:.0f}s...")
-                time.sleep(total_wait)
-                continue
-            else:
-                print(f"\n  [Rate Limited] Max retries exceeded for {url}")
-                response.raise_for_status()
-        
-        response.raise_for_status()
-    
-    return response
-
-
-def _get_cache_path(cache_key: str) -> Path:
-    CACHE_DIR.mkdir(exist_ok=True)
-    filename = hashlib.md5(cache_key.encode()).hexdigest() + ".json"
-    return CACHE_DIR / filename
-
-
-def _load_from_cache(cache_key: str, max_age_hours: int = 1) -> list | None:
-    cache_path = _get_cache_path(cache_key)
-    if not cache_path.exists():
+def _load_prs_from_json(days: int) -> list | None:
+    """Load PR data from JSON file. Returns None if file doesn't exist."""
+    file_path = _get_data_file_path(days)
+    if not file_path.exists():
         return None
-    
-    modified_time = datetime.fromtimestamp(cache_path.stat().st_mtime, tz=timezone.utc)
-    if datetime.now(timezone.utc) - modified_time > timedelta(hours=max_age_hours):
-        return None
-    
-    with open(cache_path) as f:
+    with open(file_path) as f:
         return json.load(f)
 
 
-def _save_to_cache(cache_key: str, data: list) -> None:
-    cache_path = _get_cache_path(cache_key)
-    with open(cache_path, "w") as f:
-        json.dump(data, f)
+def _save_prs_to_json(days: int, data: list) -> Path:
+    """Save PR data to JSON file with pretty formatting. Returns the file path."""
+    DATA_DIR.mkdir(exist_ok=True)
+    file_path = _get_data_file_path(days)
+    with open(file_path, "w") as f:
+        json.dump(data, f, indent=2)
+    return file_path
 
 
-def _fetch_pr_detail(pr_number: int, total: int) -> dict:
-    """Fetch detailed PR data including additions, deletions, changed_files."""
-    global _progress_count
+# =============================================================================
+# GitHub API
+# =============================================================================
+
+def _build_session() -> requests.Session:
+    """Build a requests session with auth headers pre-configured."""
+    if not GITHUB_TOKEN:
+        raise ValueError("GITHUB_TOKEN environment variable is required for GraphQL API")
     
-    url = f"{BASE_URL}/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}"
-    response = _request_with_retry("GET", url)
-    detail = response.json()
-    
-    with _progress_lock:
-        _progress_count += 1
-        if _progress_count % 25 == 0 or _progress_count == total:
-            print(f"  Progress: {_progress_count}/{total} PRs processed")
-    
-    return detail
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Content-Type": "application/json",
+    })
+    return session
 
 
-def _fetch_merged_pr_numbers(days: int) -> tuple[list[dict], bool]:
+def _graphql_request(session: requests.Session, query: str, variables: dict = None) -> dict:
     """
-    Fetch basic info for merged PRs from the last N days.
+    Make a GraphQL request with retry/backoff for rate limits and server errors.
+    
+    Retries on: 403, 429 (rate limit), 500, 502, 503, 504 (server errors), timeouts.
+    Returns the 'data' portion of the response.
+    Raises an exception after all retries are exhausted.
+    """
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+    
+    last_error = None
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = session.post(GRAPHQL_URL, json=payload, timeout=REQUEST_TIMEOUT)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if "errors" in result:
+                    error_msg = result["errors"][0].get("message", "Unknown GraphQL error")
+                    if "rate limit" in error_msg.lower():
+                        wait_time = BACKOFF_FACTOR * (2 ** attempt)
+                        print(f"  [Rate Limited] Retry {attempt + 1}/{MAX_RETRIES} in {wait_time:.0f}s...")
+                        time.sleep(wait_time)
+                        continue
+                    raise Exception(f"GraphQL error: {error_msg}")
+                return result.get("data", {})
+            
+            if response.status_code in (403, 429):
+                retry_after = response.headers.get("Retry-After")
+                reset_time = response.headers.get("X-RateLimit-Reset")
+                
+                if retry_after:
+                    wait_time = float(retry_after)
+                elif reset_time:
+                    wait_time = max(0, int(reset_time) - time.time()) + 1
+                else:
+                    wait_time = BACKOFF_FACTOR * (2 ** attempt)
+                
+                wait_time = min(wait_time, 120)
+                
+                if attempt < MAX_RETRIES - 1:
+                    print(f"  [Rate Limited] HTTP {response.status_code}, retry in {wait_time:.0f}s...")
+                    time.sleep(wait_time)
+                    continue
+            
+            if response.status_code in (500, 502, 503, 504):
+                wait_time = BACKOFF_FACTOR * (2 ** attempt)
+                if attempt < MAX_RETRIES - 1:
+                    print(f"  [Server Error] HTTP {response.status_code}, retry {attempt + 1}/{MAX_RETRIES} in {wait_time:.0f}s...")
+                    time.sleep(wait_time)
+                    continue
+                last_error = f"HTTP {response.status_code} after {MAX_RETRIES} retries"
+            else:
+                response.raise_for_status()
+                
+        except requests.exceptions.Timeout:
+            wait_time = BACKOFF_FACTOR * (2 ** attempt)
+            if attempt < MAX_RETRIES - 1:
+                print(f"  [Timeout] Retry {attempt + 1}/{MAX_RETRIES} in {wait_time:.0f}s...")
+                time.sleep(wait_time)
+                continue
+            last_error = f"Timeout after {MAX_RETRIES} retries"
+            
+        except requests.exceptions.ConnectionError as e:
+            wait_time = BACKOFF_FACTOR * (2 ** attempt)
+            if attempt < MAX_RETRIES - 1:
+                print(f"  [Connection Error] Retry {attempt + 1}/{MAX_RETRIES} in {wait_time:.0f}s...")
+                time.sleep(wait_time)
+                continue
+            last_error = f"Connection error: {e}"
+    
+    raise Exception(last_error or "Max retries exceeded for GraphQL request")
+
+
+PULL_REQUESTS_QUERY = """
+query($owner: String!, $name: String!, $first: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(
+      first: $first
+      after: $after
+      states: [MERGED]
+      orderBy: {field: UPDATED_AT, direction: DESC}
+    ) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        number
+        createdAt
+        mergedAt
+        additions
+        deletions
+        changedFiles
+        comments { totalCount }
+        reviews { totalCount }
+        author { login }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}
+"""
+
+
+def _fetch_merged_prs_graphql(
+    days: int,
+    session: requests.Session,
+) -> tuple[list[dict], bool, bool]:
+    """
+    Fetch merged PRs from the last N days using GraphQL.
     
     Returns:
-        (list of PR dicts, exceeded_limit: bool)
-        
-    Note: Results are sorted by updated_at, not merged_at, so we collect
-    candidates first then filter strictly by merged_at date.
+        (list of PR dicts, early_stopped: bool, is_partial: bool)
     """
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff_ts = cutoff_date.timestamp()
     
-    pulls_url = f"{BASE_URL}/repos/{REPO_OWNER}/{REPO_NAME}/pulls"
-    params = {
-        "state": "closed",
-        "sort": "updated",
-        "direction": "desc",
-        "per_page": 100,
-    }
-    
-    candidate_prs = []
+    filtered_prs = []
+    cursor = None
     page = 1
-    stop_pagination = False
+    consecutive_empty_pages = 0
+    early_stopped = False
+    is_partial = False
     
-    print(f"  Scanning closed PRs...")
-    print(f"  (Max {MAX_PAGES} pages, cutoff: {cutoff_date.strftime('%Y-%m-%d')})")
+    print(f"  Fetching from GitHub API (cutoff: {cutoff_date.strftime('%Y-%m-%d')})...")
     
-    while not stop_pagination and page <= MAX_PAGES:
-        params["page"] = page
-        response = _request_with_retry("GET", pulls_url, params=params)
-        prs = response.json()
+    while page <= MAX_PAGES:
+        variables = {
+            "owner": REPO_OWNER,
+            "name": REPO_NAME,
+            "first": PAGE_SIZE,
+            "after": cursor,
+        }
         
-        if not prs:
-            print(f"  Page {page}: empty, stopping")
+        try:
+            data = _graphql_request(session, PULL_REQUESTS_QUERY, variables)
+        except Exception as e:
+            print(f"  [Error] Page {page} failed: {e}")
+            if filtered_prs:
+                print(f"  Returning partial data ({len(filtered_prs)} PRs collected so far)")
+                is_partial = True
+                break
+            raise
+        
+        repo = data.get("repository")
+        if not repo:
+            print(f"  Page {page}: no repository data, stopping")
             break
         
-        merged_on_page = 0
-        for pr in prs:
-            if pr["merged_at"] is not None:
-                candidate_prs.append({
-                    "pr_number": pr["number"],
-                    "author": pr["user"]["login"] if pr["user"] else "unknown",
-                    "created_at": pr["created_at"],
-                    "merged_at": pr["merged_at"],
-                })
-                merged_on_page += 1
+        pull_requests = repo.get("pullRequests", {})
+        nodes = pull_requests.get("nodes", [])
+        page_info = pull_requests.get("pageInfo", {})
         
-        # Check if the last PR on this page is old enough to stop
-        if prs:
-            last_updated = prs[-1].get("updated_at")
-            if last_updated:
-                last_updated_dt = datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
-                if last_updated_dt < cutoff_date:
-                    print(f"  Page {page}: {merged_on_page} merged, reached cutoff date")
-                    stop_pagination = True
-                else:
-                    print(f"  Page {page}: {merged_on_page} merged")
+        if not nodes:
+            print(f"  Page {page}: empty")
+            break
         
+        in_range_count = 0
+        for pr in nodes:
+            merged_at_str = pr.get("mergedAt")
+            if not merged_at_str:
+                continue
+            
+            merged_at = datetime.fromisoformat(merged_at_str.replace("Z", "+00:00"))
+            if merged_at.timestamp() < cutoff_ts:
+                continue
+            
+            in_range_count += 1
+            author = pr.get("author")
+            
+            filtered_prs.append({
+                "pr_number": pr.get("number"),
+                "author": author.get("login") if author else "unknown",
+                "created_at": pr.get("createdAt"),
+                "merged_at": merged_at_str,
+                "additions": pr.get("additions", 0),
+                "deletions": pr.get("deletions", 0),
+                "changed_files": pr.get("changedFiles", 0),
+                "comments": pr.get("comments", {}).get("totalCount", 0),
+                "review_comments": pr.get("reviews", {}).get("totalCount", 0),
+            })
+        
+        should_log = (page % 10 == 0) or (in_range_count < PAGE_SIZE) or (page == 1)
+        if should_log:
+            rate_limit = data.get("rateLimit", {})
+            remaining = rate_limit.get("remaining", "?")
+            print(f"  Page {page}: {in_range_count} in range (total: {len(filtered_prs)}, API remaining: {remaining})")
+        
+        if in_range_count == 0:
+            consecutive_empty_pages += 1
+            if consecutive_empty_pages >= EARLY_STOP_THRESHOLD:
+                print(f"  Stopping early: {EARLY_STOP_THRESHOLD} consecutive pages with 0 PRs in range")
+                early_stopped = True
+                break
+        else:
+            consecutive_empty_pages = 0
+        
+        if not page_info.get("hasNextPage"):
+            print(f"  No more pages available")
+            break
+        
+        if page % CHECKPOINT_INTERVAL == 0 and filtered_prs:
+            _save_prs_to_json(days, filtered_prs)
+        
+        cursor = page_info.get("endCursor")
         page += 1
     
     if page > MAX_PAGES:
         print(f"  Reached max page limit ({MAX_PAGES})")
     
-    # Strictly filter by merged_at date
-    filtered_prs = []
-    for pr in candidate_prs:
-        merged_at = datetime.fromisoformat(pr["merged_at"].replace("Z", "+00:00"))
-        if merged_at >= cutoff_date:
-            filtered_prs.append(pr)
-    
-    print(f"  Candidates: {len(candidate_prs)}, After date filter: {len(filtered_prs)}")
-    
-    # Check if we exceeded the warning limit
-    exceeded_limit = len(filtered_prs) > MAX_PRS_WARNING
-    
-    return filtered_prs, exceeded_limit
+    return filtered_prs, early_stopped, is_partial
 
 
-def fetch_all_data(days: int = 90, use_cache: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+# =============================================================================
+# Main API
+# =============================================================================
+
+def fetch_all_data(
+    days: int = 90,
+    refresh: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """
     Fetch merged PRs from the last N days.
     
+    JSON-first behavior:
+    - If refresh=False and JSON file exists, loads from file immediately.
+    - If refresh=True or no JSON file, fetches from GitHub API and saves to JSON.
+    
+    Args:
+        days: Number of days to look back
+        refresh: If True, force fetch from API even if JSON file exists
+    
     Returns:
-        (prs_df, reviews_df) - reviews_df is always empty (simplified mode)
-    
-    Note: This simplified version does not fetch per-PR reviews to reduce
-    API calls. The analysis module uses comment counts as a collaboration proxy.
+        (prs_df, reviews_df, metadata)
+        - reviews_df is always empty
+        - metadata contains: source, count, file_path, is_partial, early_stopped, runtime
     """
-    global _progress_count
-    
     start_time = time.time()
+    file_path = _get_data_file_path(days)
+    metadata = {
+        "source": None,
+        "count": 0,
+        "file_path": str(file_path),
+        "is_partial": False,
+        "early_stopped": False,
+    }
     
-    pr_cache_key = f"merged_prs_{REPO_OWNER}_{REPO_NAME}_{days}_v2"
-    
-    if use_cache:
-        cached_prs = _load_from_cache(pr_cache_key)
-        if cached_prs is not None:
+    # JSON-first: check for existing file unless refresh requested
+    if not refresh:
+        existing_data = _load_prs_from_json(days)
+        if existing_data is not None:
             elapsed = time.time() - start_time
-            print(f"  Loaded from cache in {elapsed:.1f}s")
-            return pd.DataFrame(cached_prs), pd.DataFrame()
+            print(f"  Loaded {len(existing_data)} PRs from {file_path}")
+            metadata.update(source="json", count=len(existing_data), runtime=elapsed)
+            return pd.DataFrame(existing_data), pd.DataFrame(), metadata
+        else:
+            print(f"  No local JSON found, fetching from GitHub...")
+    else:
+        print(f"  Refresh requested, fetching fresh PR data from GitHub...")
     
-    # Step 1: Get list of merged PRs (basic info only)
-    print("\nStep 1: Identifying merged PRs...")
-    merged_prs_basic, exceeded_limit = _fetch_merged_pr_numbers(days)
+    # Fetch from API
+    try:
+        session = _build_session()
+        pr_data, early_stopped, is_partial = _fetch_merged_prs_graphql(days, session)
+    except ValueError as e:
+        print(f"  [Error] {e}")
+        return pd.DataFrame(), pd.DataFrame(), metadata
+    except Exception as e:
+        print(f"  [Error] Failed to fetch PRs: {e}")
+        # Try to return existing JSON as fallback
+        existing_data = _load_prs_from_json(days)
+        if existing_data:
+            print(f"  Returning existing JSON as fallback ({len(existing_data)} PRs)")
+            elapsed = time.time() - start_time
+            metadata.update(source="json (fallback)", count=len(existing_data), runtime=elapsed)
+            return pd.DataFrame(existing_data), pd.DataFrame(), metadata
+        return pd.DataFrame(), pd.DataFrame(), metadata
     
-    if not merged_prs_basic:
+    if not pr_data:
         print("  No merged PRs found in the specified time range.")
-        return pd.DataFrame(), pd.DataFrame()
+        elapsed = time.time() - start_time
+        metadata.update(source="api", count=0, runtime=elapsed)
+        return pd.DataFrame(), pd.DataFrame(), metadata
     
-    print(f"\n  Found {len(merged_prs_basic)} merged PRs in the last {days} days")
-    
-    if exceeded_limit:
-        print(f"\n  [WARNING] PR count ({len(merged_prs_basic)}) exceeds safety limit ({MAX_PRS_WARNING}).")
-        print("  Stopping to avoid excessive API calls.")
-        print("  Consider reducing the time window or investigate why there are so many PRs.")
-        return pd.DataFrame(), pd.DataFrame()
-    
-    # Step 2: Fetch PR details concurrently (no reviews)
-    print(f"\nStep 2: Fetching details for {len(merged_prs_basic)} PRs...")
-    print(f"  Using {MAX_WORKERS} concurrent workers")
-    _progress_count = 0
-    
-    pr_data = []
-    failed_prs = []
-    
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(
-                _fetch_pr_detail,
-                pr["pr_number"],
-                len(merged_prs_basic)
-            ): pr
-            for pr in merged_prs_basic
-        }
-        
-        for future in as_completed(futures):
-            basic_pr = futures[future]
-            try:
-                detail = future.result()
-                
-                pr_data.append({
-                    "pr_number": basic_pr["pr_number"],
-                    "author": basic_pr["author"],
-                    "created_at": basic_pr["created_at"],
-                    "merged_at": basic_pr["merged_at"],
-                    "additions": detail.get("additions", 0),
-                    "deletions": detail.get("deletions", 0),
-                    "changed_files": detail.get("changed_files", 0),
-                    "comments": detail.get("comments", 0),
-                    "review_comments": detail.get("review_comments", 0),
-                })
-                
-            except requests.exceptions.HTTPError as e:
-                if e.response is not None and e.response.status_code in (403, 429):
-                    print(f"\n  [Rate Limit Error] PR #{basic_pr['pr_number']}: {e}")
-                else:
-                    print(f"\n  [HTTP Error] PR #{basic_pr['pr_number']}: {e}")
-                failed_prs.append(basic_pr["pr_number"])
-            except Exception as e:
-                print(f"\n  [Error] PR #{basic_pr['pr_number']}: {e}")
-                failed_prs.append(basic_pr["pr_number"])
-    
-    if failed_prs:
-        print(f"\n  Warning: Failed to fetch {len(failed_prs)} PRs: {failed_prs[:10]}{'...' if len(failed_prs) > 10 else ''}")
-    
-    # Cache results
-    if use_cache and pr_data:
-        _save_to_cache(pr_cache_key, pr_data)
+    # Save to JSON
+    saved_path = _save_prs_to_json(days, pr_data)
+    print(f"  Saved {len(pr_data)} PRs to {saved_path}")
     
     elapsed = time.time() - start_time
-    print(f"\nCompleted in {elapsed:.1f}s ({len(pr_data)} PRs)")
+    metadata.update(
+        source="api",
+        count=len(pr_data),
+        is_partial=is_partial,
+        early_stopped=early_stopped,
+        runtime=elapsed,
+    )
     
-    # Return empty reviews DataFrame (simplified mode)
-    return pd.DataFrame(pr_data), pd.DataFrame()
+    if len(pr_data) > MAX_PRS_WARNING:
+        print(f"  [Note] High PR count ({len(pr_data)}), which is unusual but OK.")
+    
+    return pd.DataFrame(pr_data), pd.DataFrame(), metadata
 
 
-def fetch_merged_prs(days: int = 90, use_cache: bool = True) -> pd.DataFrame:
-    """Fetch merged PRs. Delegates to fetch_all_data."""
-    prs_df, _ = fetch_all_data(days=days, use_cache=use_cache)
+def fetch_merged_prs(days: int = 90, refresh: bool = False) -> pd.DataFrame:
+    """Fetch merged PRs. Convenience wrapper around fetch_all_data."""
+    prs_df, _, _ = fetch_all_data(days=days, refresh=refresh)
     return prs_df
 
 
+# =============================================================================
+# CLI
+# =============================================================================
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Fetch GitHub PR data for analysis")
+    parser.add_argument("--refresh", action="store_true", help="Force refresh from GitHub API")
+    parser.add_argument("--days", type=int, default=90, help="Number of days to look back")
+    args = parser.parse_args()
+    
     overall_start = time.time()
     
     print("=" * 60)
-    print("GitHub Client Sanity Check (Simplified Mode)")
+    print("GitHub PR Data Fetcher")
     print("=" * 60)
     
     if not GITHUB_TOKEN:
-        print("\nWARNING: GITHUB_TOKEN not set. API rate limits will be very low.")
-        print("Set it with: export GITHUB_TOKEN=your_token\n")
-    else:
-        print("\nGITHUB_TOKEN detected.")
+        print("\nWARNING: GITHUB_TOKEN not set.")
+        print("JSON-only mode: will fail if no local data exists.")
     
-    print(f"\nFetching data from {REPO_OWNER}/{REPO_NAME}...")
-    print(f"Configuration: MAX_WORKERS={MAX_WORKERS}, REQUEST_DELAY={REQUEST_DELAY}s")
-    print("Note: Reviews are not fetched in simplified mode.")
-    
-    prs_df, reviews_df = fetch_all_data(days=90, use_cache=True)
+    print(f"\nRepository: {REPO_OWNER}/{REPO_NAME}")
+    print(f"Time window: {args.days} days")
+    print(f"Refresh: {args.refresh}")
+    print(f"Data file: {_get_data_file_path(args.days)}")
     
     print("\n" + "-" * 60)
-    print("MERGED PRs")
+    
+    prs_df, reviews_df, metadata = fetch_all_data(days=args.days, refresh=args.refresh)
+    
+    print("\n" + "-" * 60)
+    print("SUMMARY")
     print("-" * 60)
-    print(f"Total PRs fetched: {len(prs_df)}")
+    print(f"Source: {metadata.get('source', 'unknown')}")
+    print(f"Total PRs: {metadata.get('count', 0)}")
+    print(f"File: {metadata.get('file_path', 'N/A')}")
+    print(f"Partial: {metadata.get('is_partial', False)}")
+    print(f"Early stopped: {metadata.get('early_stopped', False)}")
+    print(f"Runtime: {metadata.get('runtime', 0):.2f}s")
+    
     if not prs_df.empty:
         print(f"\nColumns: {list(prs_df.columns)}")
         print(f"\nFirst 5 rows:")
         print(prs_df.head().to_string())
     
-    print("\n" + "-" * 60)
-    print("PR REVIEWS")
-    print("-" * 60)
-    print(f"Reviews DataFrame: empty (simplified mode)")
-    print("Collaboration scores will use comment-based fallback model.")
-    
     overall_elapsed = time.time() - overall_start
     print("\n" + "=" * 60)
-    print(f"Sanity check complete! Total runtime: {overall_elapsed:.1f}s")
+    print(f"Done in {overall_elapsed:.2f}s")
     print("=" * 60)

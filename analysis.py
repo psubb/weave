@@ -237,7 +237,7 @@ if __name__ == "__main__":
     print("=" * 60)
     
     print("\nLoading data from GitHub client...")
-    prs_df, reviews_df = fetch_all_data(days=90, use_cache=True)
+    prs_df, reviews_df, _ = fetch_all_data(days=90, refresh=False)
     
     print(f"\nInput data:")
     print(f"  PRs: {len(prs_df)} rows")
